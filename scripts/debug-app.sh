@@ -17,6 +17,7 @@ Commands:
   run           Launch app only
   install       Install APK only
   build         Build debug APK only
+  clean         Uninstall app from simulator/device only
   logs          Tail logcat for app process only
   crash         Show crash-focused logcat
   clean-install Uninstall app, install again, then run
@@ -60,6 +61,12 @@ start_emulator_if_needed() {
 build_apk() {
   echo "Building debug APK..."
   (cd "$ROOT_DIR" && ./gradlew :app:assembleDebug)
+}
+
+clean_only() {
+  echo "Uninstalling app (clean only)..."
+  "$ADB" uninstall "$PACKAGE_NAME" >/dev/null 2>&1 || true
+  echo "Uninstall complete."
 }
 
 install_apk() {
@@ -140,6 +147,10 @@ main() {
       ;;
     build)
       build_apk
+      ;;
+    clean)
+      start_emulator_if_needed
+      clean_only
       ;;
     install)
       start_emulator_if_needed

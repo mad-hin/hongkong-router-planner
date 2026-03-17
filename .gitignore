@@ -14,3 +14,7 @@ app/src/main/res/raw/*.lc
 
 # environment files
 .env
+
+# Android artifacts
+*.apk
+*.aab

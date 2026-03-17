@@ -9,6 +9,7 @@ import android.location.LocationManager
 import android.net.Uri
 import android.os.Bundle
 import android.text.InputType
+import android.util.Log
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
@@ -28,10 +29,11 @@ import com.universalglasses.appcontract.UserSettingField
 import com.universalglasses.appcontract.UserSettingInputType
 import com.universalglasses.appcontract.commandsWithDefaults
 import com.universalglasses.core.ConnectionState
+import com.universalglasses.core.DisplayOptions
 import com.universalglasses.core.ExternalActivityBridge
 import com.universalglasses.core.ExternalActivityResult
-import com.universalglasses.core.GlassesEvent
 import com.universalglasses.core.GlassesClient
+import com.universalglasses.core.GlassesEvent
 import com.universalglasses.core.GlassesModel
 import com.universalglasses.device.frame.embedded.EmbeddedFrameGlassesClient
 import com.universalglasses.device.rayneo.installer.RayNeoApkSource
@@ -39,19 +41,19 @@ import com.universalglasses.device.rayneo.installer.RayNeoInstallerConfig
 import com.universalglasses.device.rayneo.installer.RayNeoInstallerGlassesClient
 import com.universalglasses.device.rokid.RokidGlassesClient
 import com.universalglasses.device.sim.SimulatorGlassesClient
+import java.io.File
+import java.util.Locale
+import kotlin.coroutines.resume
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import java.io.File
-import java.util.Locale
-import kotlin.coroutines.resume
 
 class MainActivity : AppCompatActivity() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
@@ -88,61 +90,69 @@ class MainActivity : AppCompatActivity() {
     private var stateJob: Job? = null
     private var eventsJob: Job? = null
     private var pendingConnectModel: GlassesModel? = null
-    private var externalActivityContinuation: kotlinx.coroutines.CancellableContinuation<ExternalActivityResult>? = null
+    private var externalActivityContinuation:
+            kotlinx.coroutines.CancellableContinuation<ExternalActivityResult>? =
+            null
     private val externalActivityMutex = Mutex()
 
-    private val requestPermissionsLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestMultiplePermissions()
-    ) { result ->
-        val allGranted = result.values.all { it }
-        if (!allGranted) {
-            appendLog("Permissions denied; cannot connect.")
-            tvStatus.text = "Status: permissions denied"
-            pendingConnectModel = null
-            return@registerForActivityResult
-        }
-        val model = pendingConnectModel
-        pendingConnectModel = null
-        if (model != null) connect(model)
-    }
-
-    private val externalActivityLauncher = registerForActivityResult(StartActivityForResult()) { result ->
-        externalActivityContinuation?.let { continuation ->
-            if (continuation.isActive) {
-                continuation.resume(
-                    ExternalActivityResult(
-                        resultCode = result.resultCode,
-                        data = result.data,
+    private val requestPermissionsLauncher =
+            registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result
+                ->
+                val allGranted = result.values.all { it }
+                if (!allGranted) {
+                    val denied = result.filterValues { !it }.keys
+                    val deniedFriendly = denied.joinToString { it.substringAfterLast('.') }
+                    appendLog(
+                            "Permission required: please grant $deniedFriendly in the system prompt or Settings."
                     )
-                )
+                    tvStatus.text = "Status: permission needed"
+                    pendingConnectModel = null
+                    scope.launch { announceCurrentDistrict() }
+                    return@registerForActivityResult
+                }
+                scope.launch { announceCurrentDistrict() }
+                val model = pendingConnectModel
+                pendingConnectModel = null
+                if (model != null) connect(model)
             }
-        }
-        externalActivityContinuation = null
-    }
+
+    private val externalActivityLauncher =
+            registerForActivityResult(StartActivityForResult()) { result ->
+                externalActivityContinuation?.let { continuation ->
+                    if (continuation.isActive) {
+                        continuation.resume(
+                                ExternalActivityResult(
+                                        resultCode = result.resultCode,
+                                        data = result.data,
+                                )
+                        )
+                    }
+                }
+                externalActivityContinuation = null
+            }
 
     /** Launcher for picking the Rokid SN license (.lc) file at runtime. */
-    private val pickSnLicenseLauncher = registerForActivityResult(
-        ActivityResultContracts.OpenDocument()
-    ) { uri: Uri? ->
-        if (uri == null) return@registerForActivityResult
-        try {
-            val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
-            if (bytes == null || bytes.isEmpty()) {
-                appendLog("Rokid: selected file is empty.")
-                return@registerForActivityResult
+    private val pickSnLicenseLauncher =
+            registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
+                if (uri == null) return@registerForActivityResult
+                try {
+                    val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                    if (bytes == null || bytes.isEmpty()) {
+                        appendLog("Rokid: selected file is empty.")
+                        return@registerForActivityResult
+                    }
+                    // Persist the .lc bytes into internal storage so we survive app restarts.
+                    val lcFile = File(filesDir, ROKID_LC_FILENAME)
+                    lcFile.writeBytes(bytes)
+                    // Extract a display name for the UI.
+                    val displayName = queryFileName(uri) ?: "sn_license.lc"
+                    rokidPrefs.edit().putString(PREF_ROKID_LC_DISPLAY_NAME, displayName).apply()
+                    tvSnLicenseFile.text = displayName
+                    appendLog("Rokid: SN license loaded (${bytes.size} bytes).")
+                } catch (e: Exception) {
+                    appendLog("Rokid: failed to read file – ${e.message}")
+                }
             }
-            // Persist the .lc bytes into internal storage so we survive app restarts.
-            val lcFile = File(filesDir, ROKID_LC_FILENAME)
-            lcFile.writeBytes(bytes)
-            // Extract a display name for the UI.
-            val displayName = queryFileName(uri) ?: "sn_license.lc"
-            rokidPrefs.edit().putString(PREF_ROKID_LC_DISPLAY_NAME, displayName).apply()
-            tvSnLicenseFile.text = displayName
-            appendLog("Rokid: SN license loaded (${bytes.size} bytes).")
-        } catch (e: Exception) {
-            appendLog("Rokid: failed to read file – ${e.message}")
-        }
-    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -170,43 +180,45 @@ class MainActivity : AppCompatActivity() {
         // Restore previously-saved Rokid credentials into the UI.
         restoreRokidCredentialUI()
 
-        btnPickSnLicense.setOnClickListener {
-            pickSnLicenseLauncher.launch(arrayOf("*/*"))
-        }
+        btnPickSnLicense.setOnClickListener { pickSnLicenseLauncher.launch(arrayOf("*/*")) }
 
-        val deviceItems = if (BuildConfig.XG_SIMULATOR) {
-            listOf("SIMULATOR")
-        } else {
-            listOf("ROKID", "META", "FRAME", "RAYNEO", "SIMULATOR")
-        }
-        spDevice.adapter = ArrayAdapter(
-            this,
-            android.R.layout.simple_spinner_dropdown_item,
-            deviceItems,
-        )
+        val deviceItems =
+                if (BuildConfig.XG_SIMULATOR) {
+                    listOf("SIMULATOR")
+                } else {
+                    listOf("ROKID", "META", "FRAME", "RAYNEO", "SIMULATOR")
+                }
+        spDevice.adapter =
+                ArrayAdapter(
+                        this,
+                        android.R.layout.simple_spinner_dropdown_item,
+                        deviceItems,
+                )
 
-        spDevice.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
-            override fun onItemSelected(
-                parent: android.widget.AdapterView<*>?,
-                view: android.view.View?,
-                position: Int,
-                id: Long
-            ) {
-                onDeviceSelectionChanged(spDevice.selectedItem?.toString() ?: "ROKID")
-            }
+        spDevice.onItemSelectedListener =
+                object : android.widget.AdapterView.OnItemSelectedListener {
+                    override fun onItemSelected(
+                            parent: android.widget.AdapterView<*>?,
+                            view: android.view.View?,
+                            position: Int,
+                            id: Long
+                    ) {
+                        onDeviceSelectionChanged(spDevice.selectedItem?.toString() ?: "ROKID")
+                    }
 
-            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
-        }
+                    override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
+                }
 
         btnConnect.setOnClickListener {
             val selected = spDevice.selectedItem?.toString() ?: "ROKID"
-            val model = when (selected) {
-                "SIMULATOR" -> GlassesModel.SIMULATOR
-                "META" -> GlassesModel.META
-                "FRAME" -> GlassesModel.FRAME
-                "RAYNEO" -> GlassesModel.RAYNEO
-                else -> GlassesModel.ROKID
-            }
+            val model =
+                    when (selected) {
+                        "SIMULATOR" -> GlassesModel.SIMULATOR
+                        "META" -> GlassesModel.META
+                        "FRAME" -> GlassesModel.FRAME
+                        "RAYNEO" -> GlassesModel.RAYNEO
+                        else -> GlassesModel.ROKID
+                    }
             // Save Rokid credentials entered in the UI before connecting.
             if (model == GlassesModel.ROKID) {
                 saveRokidCredentials()
@@ -234,129 +246,166 @@ class MainActivity : AppCompatActivity() {
 
     private fun connect(model: GlassesModel) {
         connectJob?.cancel()
-        connectJob = scope.launch {
-            btnConnect.isEnabled = false
-            tvStatus.text = "Status: switching to ${model.name}..."
+        connectJob =
+                scope.launch {
+                    btnConnect.isEnabled = false
+                    tvStatus.text = "Status: switching to ${model.name}..."
 
-            try {
-                // Disconnect previous client FIRST (sequentially) so we don't accidentally destroy the new one.
-                val old = client
-                client = null
-                try {
-                    old?.disconnect()
-                } catch (e: Exception) {
-                    appendLog("WARN: disconnect previous client failed: ${e.message}")
-                }
-
-                val newClient = when (model) {
-                    GlassesModel.SIMULATOR -> SimulatorGlassesClient(
-                        activity = this@MainActivity,
-                        displaySink = { text -> tvDisplay.text = text },
-                        videoPath = BuildConfig.XG_SIM_VIDEO_PATH.takeIf { it.isNotEmpty() },
-                    )
-                    GlassesModel.ROKID -> createRokidClient()
-                    GlassesModel.META -> createMetaClient()
-                    GlassesModel.FRAME -> {
-                    // SDK-owned Flutter engine + bridge
-                    EmbeddedFrameGlassesClient(this@MainActivity)
-                    }
-                    GlassesModel.RAYNEO -> {
-                        val host = etRayNeoIp.text?.toString()?.trim().orEmpty()
-                        if (host.isBlank()) {
-                            appendLog("RayNeo: please input glasses IP address first.")
-                            tvStatus.text = "Status: RayNeo IP missing"
-                            return@launch
+                    try {
+                        // Disconnect previous client FIRST (sequentially) so we don't accidentally
+                        // destroy the new one.
+                        val old = client
+                        client = null
+                        try {
+                            old?.disconnect()
+                        } catch (e: Exception) {
+                            appendLog("WARN: disconnect previous client failed: ${e.message}")
                         }
-                        RayNeoInstallerGlassesClient(
-                            context = this@MainActivity,
-                            config = RayNeoInstallerConfig(
-                                host = host,
-                                apk = RayNeoApkSource.Asset("rayneo_glass_app.apk"),
-                            )
+
+                        val newClient =
+                                when (model) {
+                                    GlassesModel.SIMULATOR ->
+                                            SimulatorGlassesClient(
+                                                    activity = this@MainActivity,
+                                                    displaySink = { text -> tvDisplay.text = text },
+                                                    videoPath =
+                                                            BuildConfig.XG_SIM_VIDEO_PATH.takeIf {
+                                                                it.isNotEmpty()
+                                                            },
+                                            )
+                                    GlassesModel.ROKID -> createRokidClient()
+                                    GlassesModel.META -> createMetaClient()
+                                    GlassesModel.FRAME -> {
+                                        // SDK-owned Flutter engine + bridge
+                                        EmbeddedFrameGlassesClient(this@MainActivity)
+                                    }
+                                    GlassesModel.RAYNEO -> {
+                                        val host = etRayNeoIp.text?.toString()?.trim().orEmpty()
+                                        if (host.isBlank()) {
+                                            appendLog(
+                                                    "RayNeo: please input glasses IP address first."
+                                            )
+                                            tvStatus.text = "Status: RayNeo IP missing"
+                                            return@launch
+                                        }
+                                        RayNeoInstallerGlassesClient(
+                                                context = this@MainActivity,
+                                                config =
+                                                        RayNeoInstallerConfig(
+                                                                host = host,
+                                                                apk =
+                                                                        RayNeoApkSource.Asset(
+                                                                                "rayneo_glass_app.apk"
+                                                                        ),
+                                                        )
+                                        )
+                                    }
+                                }
+
+                        client = newClient
+
+                        // Restart collectors for the new client.
+                        stateJob?.cancel()
+                        eventsJob?.cancel()
+
+                        stateJob = launch {
+                            newClient.state.collectLatest { st ->
+                                tvStatus.text = "Status: $st"
+                                val connected = st is ConnectionState.Connected
+                                renderCommandsForCurrentSelection(connected = connected)
+                            }
+                        }
+
+                        eventsJob = launch {
+                            newClient.events.collectLatest { ev ->
+                                when (ev) {
+                                    is GlassesEvent.Log -> appendLog(ev.message)
+                                    is GlassesEvent.Warning -> appendLog("WARN: ${ev.message}")
+                                    is GlassesEvent.Tap -> appendLog("TAP: ${ev.count}")
+                                }
+                            }
+                        }
+
+                        val r = newClient.connect()
+                        appendLog(
+                                "connect(${model.name}) => ${r.isSuccess} ${r.exceptionOrNull()?.message ?: ""}"
                         )
-                    }
-                }
-
-                client = newClient
-
-                // Restart collectors for the new client.
-                stateJob?.cancel()
-                eventsJob?.cancel()
-
-                stateJob = launch {
-                    newClient.state.collectLatest { st ->
-                        tvStatus.text = "Status: $st"
-                        val connected = st is ConnectionState.Connected
-                        renderCommandsForCurrentSelection(connected = connected)
-                    }
-                }
-
-                eventsJob = launch {
-                    newClient.events.collectLatest { ev ->
-                        when (ev) {
-                            is GlassesEvent.Log -> appendLog(ev.message)
-                            is GlassesEvent.Warning -> appendLog("WARN: ${ev.message}")
-                            is GlassesEvent.Tap -> appendLog("TAP: ${ev.count}")
+                        if (r.isFailure) {
+                            logErrorReadable("Connection failed", r.exceptionOrNull())
                         }
+                        if (r.isSuccess) {
+                            announceCurrentDistrict()
+                        }
+
+                        // After successful RayNeo install, push the current user settings to the
+                        // glasses.
+                        if (r.isSuccess &&
+                                        newClient is RayNeoInstallerGlassesClient &&
+                                        appliedSettings.isNotEmpty()
+                        ) {
+                            val pushR = newClient.pushUserSettings(appliedSettings)
+                            if (pushR.isSuccess) appendLog("Settings synced to RayNeo glasses.")
+                            else
+                                    appendLog(
+                                            "Settings sync failed: ${pushR.exceptionOrNull()?.message}"
+                                    )
+                        }
+                    } catch (e: Exception) {
+                        client = null
+                        logErrorReadable("Connect crashed (${model.name})", e)
+                        tvStatus.text = "Status: connect failed"
+                        renderCommandsForCurrentSelection(connected = false)
+                    } finally {
+                        btnConnect.isEnabled = true
                     }
                 }
-
-                val r = newClient.connect()
-                appendLog("connect(${model.name}) => ${r.isSuccess} ${r.exceptionOrNull()?.message ?: ""}")
-
-                // After successful RayNeo install, push the current user settings to the glasses.
-                if (r.isSuccess && newClient is RayNeoInstallerGlassesClient && appliedSettings.isNotEmpty()) {
-                    val pushR = newClient.pushUserSettings(appliedSettings)
-                    if (pushR.isSuccess) appendLog("Settings synced to RayNeo glasses.")
-                    else appendLog("Settings sync failed: ${pushR.exceptionOrNull()?.message}")
-                }
-            } catch (e: Exception) {
-                client = null
-                appendLog("connect(${model.name}) crashed: ${e.message ?: e.javaClass.simpleName}")
-                tvStatus.text = "Status: connect failed"
-                renderCommandsForCurrentSelection(connected = false)
-            } finally {
-                btnConnect.isEnabled = true
-            }
-        }
     }
 
     private fun createRokidClient(): RokidGlassesClient {
         // 1. Try runtime credentials (user-provided via in-app UI).
-        val auth = loadRokidAuthFromRuntime()
-            // 2. Fall back to build-time credentials (local.properties / env / res/raw).
-            ?: loadRokidAuthFromBuildConfig()
+        val auth =
+                loadRokidAuthFromRuntime()
+                // 2. Fall back to build-time credentials (local.properties / env / res/raw).
+                ?: loadRokidAuthFromBuildConfig()
 
         if (auth == null) {
             appendLog(
-                "Rokid: SN auth missing.\n" +
-                    "  Option A (recommended): select your .lc file and enter client secret in the UI above.\n" +
-                    "  Option B: put .lc under app/src/main/res/raw/ and set in local.properties:\n" +
-                    "    rokid.clientSecret=<your-client-secret>\n" +
-                    "    rokid.snRawName=<raw_resource_name_without_extension>"
+                    "Rokid: SN auth missing.\n" +
+                            "  Option A (recommended): select your .lc file and enter client secret in the UI above.\n" +
+                            "  Option B: put .lc under app/src/main/res/raw/ and set in local.properties:\n" +
+                            "    rokid.clientSecret=<your-client-secret>\n" +
+                            "    rokid.snRawName=<raw_resource_name_without_extension>"
             )
         }
 
         return RokidGlassesClient(
-            this,
-            RokidGlassesClient.RokidOptions(authorization = auth),
+                this,
+                RokidGlassesClient.RokidOptions(authorization = auth),
         )
     }
 
     private fun createMetaClient(): GlassesClient {
         return try {
             val clazz = Class.forName("com.universalglasses.device.meta.MetaWearablesGlassesClient")
-            val ctor = clazz.getConstructor(AppCompatActivity::class.java, ExternalActivityBridge::class.java)
+            val ctor =
+                    clazz.getConstructor(
+                            AppCompatActivity::class.java,
+                            ExternalActivityBridge::class.java
+                    )
             ctor.newInstance(
-                this,
-                ExternalActivityBridge { intent -> launchExternalActivity(intent) },
-            ) as GlassesClient
+                    this,
+                    ExternalActivityBridge { intent -> launchExternalActivity(intent) },
+            ) as
+                    GlassesClient
         } catch (_: ClassNotFoundException) {
             throw IllegalStateException(
-                "Meta DAT module is not available in this build. Set github_token in ~/.gradle/gradle.properties or export GITHUB_TOKEN, then sync again."
+                    "Meta DAT module is not available in this build. Set github_token in ~/.gradle/gradle.properties or export GITHUB_TOKEN, then sync again."
             )
         } catch (e: Exception) {
-            throw IllegalStateException("Failed to create MetaWearablesGlassesClient: ${e.message}", e)
+            throw IllegalStateException(
+                    "Failed to create MetaWearablesGlassesClient: ${e.message}",
+                    e
+            )
         }
     }
 
@@ -374,28 +423,31 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * Load Rokid authorization from runtime user input (internal storage + SharedPreferences).
-     */
+    /** Load Rokid authorization from runtime user input (internal storage + SharedPreferences). */
     private fun loadRokidAuthFromRuntime(): RokidGlassesClient.RokidAuthorization? {
         val secret = rokidPrefs.getString(PREF_ROKID_CLIENT_SECRET, null)?.trim().orEmpty()
         if (secret.isBlank()) return null
 
         val lcFile = File(filesDir, ROKID_LC_FILENAME)
         if (!lcFile.exists()) return null
-        val bytes = try { lcFile.readBytes() } catch (_: Exception) { ByteArray(0) }
+        val bytes =
+                try {
+                    lcFile.readBytes()
+                } catch (_: Exception) {
+                    ByteArray(0)
+                }
         if (bytes.isEmpty()) return null
 
         return RokidGlassesClient.RokidAuthorization(
-            snLc = bytes,
-            clientSecret = secret,
+                snLc = bytes,
+                clientSecret = secret,
         )
     }
 
     /**
-     * Load Rokid authorization from build-time config (BuildConfig fields + res/raw resource).
-     * This is the legacy path: developer sets rokid.clientSecret / rokid.snRawName in
-     * local.properties (or env vars) and places the .lc file in app/src/main/res/raw/.
+     * Load Rokid authorization from build-time config (BuildConfig fields + res/raw resource). This
+     * is the legacy path: developer sets rokid.clientSecret / rokid.snRawName in local.properties
+     * (or env vars) and places the .lc file in app/src/main/res/raw/.
      */
     private fun loadRokidAuthFromBuildConfig(): RokidGlassesClient.RokidAuthorization? {
         val secret = BuildConfig.ROKID_CLIENT_SECRET.trim()
@@ -405,30 +457,38 @@ class MainActivity : AppCompatActivity() {
         val resId = resources.getIdentifier(rawName, "raw", packageName)
         if (resId == 0) return null
 
-        val bytes = try {
-            resources.openRawResource(resId).use { it.readBytes() }
-        } catch (_: Exception) {
-            ByteArray(0)
-        }
+        val bytes =
+                try {
+                    resources.openRawResource(resId).use { it.readBytes() }
+                } catch (_: Exception) {
+                    ByteArray(0)
+                }
         if (bytes.isEmpty()) return null
 
         return RokidGlassesClient.RokidAuthorization(
-            snLc = bytes,
-            clientSecret = secret,
+                snLc = bytes,
+                clientSecret = secret,
         )
     }
 
     private fun ensurePermissionsThenConnect(model: GlassesModel) {
         val required = requiredPermissionsFor(model)
-        val missing = required.filter { perm ->
-            ContextCompat.checkSelfPermission(this, perm) != android.content.pm.PackageManager.PERMISSION_GRANTED
-        }
+        val missing =
+                required.filter { perm ->
+                    ContextCompat.checkSelfPermission(this, perm) !=
+                            android.content.pm.PackageManager.PERMISSION_GRANTED
+                }
         if (missing.isEmpty()) {
+            scope.launch { announceCurrentDistrict() }
             connect(model)
             return
         }
         pendingConnectModel = model
         appendLog("Requesting permissions: ${missing.joinToString()}")
+        appendLog(
+                "Please grant Location permission so we can detect your district for weather and routing."
+        )
+        scope.launch { announceCurrentDistrict() }
         requestPermissionsLauncher.launch(missing.toTypedArray())
     }
 
@@ -463,7 +523,9 @@ class MainActivity : AppCompatActivity() {
         }
 
         // Rokid needs Wi‑Fi P2P on Android 13+
-        if (model == GlassesModel.ROKID && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+        if (model == GlassesModel.ROKID &&
+                        android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU
+        ) {
             perms += Manifest.permission.NEARBY_WIFI_DEVICES
         }
 
@@ -477,16 +539,16 @@ class MainActivity : AppCompatActivity() {
     /** Update UI elements that depend on the currently selected device. */
     private fun onDeviceSelectionChanged(selected: String) {
         etRayNeoIp.visibility =
-            if (selected == "RAYNEO") android.view.View.VISIBLE else android.view.View.GONE
+                if (selected == "RAYNEO") android.view.View.VISIBLE else android.view.View.GONE
         llRokidConfig.visibility =
-            if (selected == "ROKID") android.view.View.VISIBLE else android.view.View.GONE
+                if (selected == "ROKID") android.view.View.VISIBLE else android.view.View.GONE
 
         // Display section is only useful for SIMULATOR mode
         val showDisplay = selected == "SIMULATOR"
         tvDisplayTitle.visibility =
-            if (showDisplay) android.view.View.VISIBLE else android.view.View.GONE
+                if (showDisplay) android.view.View.VISIBLE else android.view.View.GONE
         tvDisplay.visibility =
-            if (showDisplay) android.view.View.VISIBLE else android.view.View.GONE
+                if (showDisplay) android.view.View.VISIBLE else android.view.View.GONE
     }
 
     /** Toggle the collapsible settings panel. */
@@ -504,18 +566,24 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun renderCommandsForCurrentSelection(connected: Boolean) {
-        val model = when (spDevice.selectedItem?.toString()) {
-            "SIMULATOR" -> GlassesModel.SIMULATOR
-            "META" -> GlassesModel.META
-            "FRAME" -> GlassesModel.FRAME
-            "RAYNEO" -> GlassesModel.RAYNEO
-            else -> GlassesModel.ROKID
-        }
+        val model =
+                when (spDevice.selectedItem?.toString()) {
+                    "SIMULATOR" -> GlassesModel.SIMULATOR
+                    "META" -> GlassesModel.META
+                    "FRAME" -> GlassesModel.FRAME
+                    "RAYNEO" -> GlassesModel.RAYNEO
+                    else -> GlassesModel.ROKID
+                }
 
         llCommands.removeAllViews()
         val e = entry
         if (e == null) {
-            llCommands.addView(TextView(this).apply { text = "No UniversalAppEntry (meta-data com.universalglasses.app_entry_class)" })
+            llCommands.addView(
+                    TextView(this).apply {
+                        text =
+                                "No UniversalAppEntry (meta-data com.universalglasses.app_entry_class)"
+                    }
+            )
             return
         }
 
@@ -527,42 +595,66 @@ class MainActivity : AppCompatActivity() {
         val env = HostEnvironment(hostKind = HostKind.PHONE, model = model)
         val cmds = e.commandsWithDefaults(env)
         if (cmds.isEmpty()) {
-            llCommands.addView(TextView(this).apply { text = "No commands for PHONE/${model.name}" })
+            llCommands.addView(
+                    TextView(this).apply { text = "No commands for PHONE/${model.name}" }
+            )
             return
         }
 
         cmds.forEach { cmd ->
-            llCommands.addView(Button(this).apply {
-                text = cmd.title
-                setOnClickListener {
-                    scope.launch {
-                        try {
-                            val ctx = UniversalAppContext(
-                                environment = env,
-                                client = client!!,
-                                scope = scope,
-                                log = { appendLog(it) },
-                                onCapturedImage = { img ->
-                                    val bytes = img.jpegBytes
-                                    if (bytes.isNotEmpty()) {
-                                        scope.launch {
-                                            val bmp = withContext(Dispatchers.Default) {
-                                                BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                                            }
-                                            if (bmp != null) ivPreview.setImageBitmap(bmp)
-                                        }
+            llCommands.addView(
+                    Button(this).apply {
+                        text = cmd.title
+                        setOnClickListener {
+                            scope.launch {
+                                try {
+                                    val ctx =
+                                            UniversalAppContext(
+                                                    environment = env,
+                                                    client = client!!,
+                                                    scope = scope,
+                                                    log = { appendLog(it) },
+                                                    onCapturedImage = { img ->
+                                                        val bytes = img.jpegBytes
+                                                        if (bytes.isNotEmpty()) {
+                                                            scope.launch {
+                                                                val bmp =
+                                                                        withContext(
+                                                                                Dispatchers.Default
+                                                                        ) {
+                                                                            BitmapFactory
+                                                                                    .decodeByteArray(
+                                                                                            bytes,
+                                                                                            0,
+                                                                                            bytes.size
+                                                                                    )
+                                                                        }
+                                                                if (bmp != null)
+                                                                        ivPreview.setImageBitmap(
+                                                                                bmp
+                                                                        )
+                                                            }
+                                                        }
+                                                    },
+                                                    settings =
+                                                            appliedSettings +
+                                                                    resolveGpsSnapshot()
+                                                                            .toSettingsMap(),
+                                            )
+                                    val r = cmd.run(ctx)
+                                    if (r.isFailure) {
+                                        logErrorReadable(
+                                                "Command failed: ${cmd.title}",
+                                                r.exceptionOrNull()
+                                        )
                                     }
-                                },
-                                settings = appliedSettings + resolveGpsSnapshot().toSettingsMap(),
-                            )
-                            val r = cmd.run(ctx)
-                            if (r.isFailure) appendLog("Command failed: ${r.exceptionOrNull()?.message ?: "unknown"}")
-                        } catch (e: Exception) {
-                            appendLog("Command error: ${e.javaClass.simpleName}: ${e.message}")
+                                } catch (e: Exception) {
+                                    logErrorReadable("Command error: ${cmd.title}", e)
+                                }
+                            }
                         }
                     }
-                }
-            })
+            )
         }
     }
 
@@ -575,8 +667,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Render input fields for the entry's [UniversalAppEntry.userSettings].
-     * Values are pre-filled from SharedPreferences (falling back to defaults).
+     * Render input fields for the entry's [UniversalAppEntry.userSettings]. Values are pre-filled
+     * from SharedPreferences (falling back to defaults).
      */
     private fun renderSettings() {
         val e = entry ?: return
@@ -592,32 +684,36 @@ class MainActivity : AppCompatActivity() {
         settingEdits.clear()
 
         for (field in fields) {
-            val label = TextView(this).apply {
-                text = field.label
-                setPadding(0, 12, 0, 2)
-            }
+            val label =
+                    TextView(this).apply {
+                        text = field.label
+                        setPadding(0, 12, 0, 2)
+                    }
             llSettings.addView(label)
 
-            val editText = EditText(this).apply {
-                hint = field.hint
-                inputType = when (field.inputType) {
-                    UserSettingInputType.PASSWORD ->
-                        InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-                    UserSettingInputType.URL ->
-                        InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
-                    UserSettingInputType.NUMBER ->
-                        InputType.TYPE_CLASS_NUMBER
-                    else ->
-                        InputType.TYPE_CLASS_TEXT
-                }
-                layoutParams = LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT,
-                )
-                // Restore from prefs, or use default
-                val stored = settingsPrefs.getString(field.key, null)
-                setText(stored ?: field.defaultValue)
-            }
+            val editText =
+                    EditText(this).apply {
+                        hint = field.hint
+                        inputType =
+                                when (field.inputType) {
+                                    UserSettingInputType.PASSWORD ->
+                                            InputType.TYPE_CLASS_TEXT or
+                                                    InputType.TYPE_TEXT_VARIATION_PASSWORD
+                                    UserSettingInputType.URL ->
+                                            InputType.TYPE_CLASS_TEXT or
+                                                    InputType.TYPE_TEXT_VARIATION_URI
+                                    UserSettingInputType.NUMBER -> InputType.TYPE_CLASS_NUMBER
+                                    else -> InputType.TYPE_CLASS_TEXT
+                                }
+                        layoutParams =
+                                LinearLayout.LayoutParams(
+                                        LinearLayout.LayoutParams.MATCH_PARENT,
+                                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                                )
+                        // Restore from prefs, or use default
+                        val stored = settingsPrefs.getString(field.key, null)
+                        setText(stored ?: field.defaultValue)
+                    }
             llSettings.addView(editText)
             settingEdits[field.key] = editText
         }
@@ -645,8 +741,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * If the current (or last-configured) glasses model is RAYNEO and we have an IP,
-     * push the settings JSON to the glasses via ADB.
+     * If the current (or last-configured) glasses model is RAYNEO and we have an IP, push the
+     * settings JSON to the glasses via ADB.
      */
     private fun pushSettingsToRayNeoIfNeeded() {
         if (appliedSettings.isEmpty()) return
@@ -662,13 +758,19 @@ class MainActivity : AppCompatActivity() {
 
         scope.launch {
             try {
-                val pusher = rayNeoClient ?: RayNeoInstallerGlassesClient(
-                    context = this@MainActivity,
-                    config = RayNeoInstallerConfig(
-                        host = ip,
-                        apk = RayNeoApkSource.Asset("rayneo_glass_app.apk"),
-                    ),
-                )
+                val pusher =
+                        rayNeoClient
+                                ?: RayNeoInstallerGlassesClient(
+                                        context = this@MainActivity,
+                                        config =
+                                                RayNeoInstallerConfig(
+                                                        host = ip,
+                                                        apk =
+                                                                RayNeoApkSource.Asset(
+                                                                        "rayneo_glass_app.apk"
+                                                                ),
+                                                ),
+                                )
                 val r = pusher.pushUserSettings(appliedSettings)
                 if (r.isSuccess) {
                     appendLog("Settings pushed to RayNeo glasses.")
@@ -689,64 +791,123 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * Resolve district and coordinates from Android GPS for command context settings.
-     */
-    private suspend fun resolveGpsSnapshot(): GpsSnapshot = withContext(Dispatchers.IO) {
-        val fallback = "Hong Kong"
-        val hasFine = ContextCompat.checkSelfPermission(
-            this@MainActivity,
-            Manifest.permission.ACCESS_FINE_LOCATION,
-        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
-        val hasCoarse = ContextCompat.checkSelfPermission(
-            this@MainActivity,
-            Manifest.permission.ACCESS_COARSE_LOCATION,
-        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
-        if (!hasFine && !hasCoarse) return@withContext GpsSnapshot(fallback, null, null)
+    /** Resolve district and coordinates from Android GPS for command context settings. */
+    private suspend fun resolveGpsSnapshot(): GpsSnapshot =
+            withContext(Dispatchers.IO) {
+                val fallback = "Hong Kong"
+                val hasFine =
+                        ContextCompat.checkSelfPermission(
+                                this@MainActivity,
+                                Manifest.permission.ACCESS_FINE_LOCATION,
+                        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                val hasCoarse =
+                        ContextCompat.checkSelfPermission(
+                                this@MainActivity,
+                                Manifest.permission.ACCESS_COARSE_LOCATION,
+                        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                if (!hasFine && !hasCoarse) return@withContext GpsSnapshot(fallback, null, null)
 
-        val lm = getSystemService(Context.LOCATION_SERVICE) as? LocationManager
-            ?: return@withContext GpsSnapshot(fallback, null, null)
-        val providers = listOf(
-            LocationManager.GPS_PROVIDER,
-            LocationManager.NETWORK_PROVIDER,
-            LocationManager.PASSIVE_PROVIDER,
-        )
+                val lm =
+                        getSystemService(Context.LOCATION_SERVICE) as? LocationManager
+                                ?: return@withContext GpsSnapshot(fallback, null, null)
+                val providers =
+                        listOf(
+                                LocationManager.GPS_PROVIDER,
+                                LocationManager.NETWORK_PROVIDER,
+                                LocationManager.PASSIVE_PROVIDER,
+                        )
 
-        val location = providers.asSequence().mapNotNull { provider ->
-            runCatching { lm.getLastKnownLocation(provider) }.getOrNull()
-        }.maxByOrNull { it.time }
+                val location =
+                        providers
+                                .asSequence()
+                                .mapNotNull { provider ->
+                                    runCatching { lm.getLastKnownLocation(provider) }.getOrNull()
+                                }
+                                .maxByOrNull { it.time }
 
-        if (location == null) return@withContext GpsSnapshot(fallback, null, null)
+                if (location == null) return@withContext GpsSnapshot(fallback, null, null)
 
-        val district = if (!Geocoder.isPresent()) {
-            fallback
-        } else {
-            val geocoder = Geocoder(this@MainActivity, Locale.ENGLISH)
-            val address = runCatching {
-                @Suppress("DEPRECATION")
-                geocoder.getFromLocation(location.latitude, location.longitude, 1)
-                    ?.firstOrNull()
-            }.getOrNull()
+                val district =
+                        if (!Geocoder.isPresent()) {
+                            fallback
+                        } else {
+                            val geocoder = Geocoder(this@MainActivity, Locale.ENGLISH)
+                            val address =
+                                    runCatching {
+                                                @Suppress("DEPRECATION")
+                                                geocoder.getFromLocation(
+                                                                location.latitude,
+                                                                location.longitude,
+                                                                1
+                                                        )
+                                                        ?.firstOrNull()
+                                            }
+                                            .getOrNull()
 
-            address?.subLocality
-                ?: address?.locality
-                ?: address?.subAdminArea
-                ?: address?.adminArea
-                ?: fallback
-        }
+                            address?.subLocality
+                                    ?: address?.locality ?: address?.subAdminArea
+                                            ?: address?.adminArea ?: fallback
+                        }
 
-        GpsSnapshot(district, location.latitude, location.longitude)
-    }
+                GpsSnapshot(district, location.latitude, location.longitude)
+            }
 
     private data class GpsSnapshot(
-        val district: String,
-        val latitude: Double?,
-        val longitude: Double?,
+            val district: String,
+            val latitude: Double?,
+            val longitude: Double?,
     ) {
         fun toSettingsMap(): Map<String, String> = buildMap {
             put(KEY_DISTRICT, district)
             latitude?.let { put(KEY_USER_LAT, it.toString()) }
             longitude?.let { put(KEY_USER_LNG, it.toString()) }
+        }
+    }
+
+    private suspend fun announceCurrentDistrict() {
+        val hasFine =
+                ContextCompat.checkSelfPermission(
+                        this,
+                        Manifest.permission.ACCESS_FINE_LOCATION,
+                ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        val hasCoarse =
+                ContextCompat.checkSelfPermission(
+                        this,
+                        Manifest.permission.ACCESS_COARSE_LOCATION,
+                ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+
+        if (!hasFine && !hasCoarse) {
+            val msg =
+                    "Location access is required.\nPlease grant Location permission in Android Settings."
+            appendLog("Location permission not granted.")
+            client?.display(msg, DisplayOptions())
+            return
+        }
+
+        val gps = resolveGpsSnapshot()
+        appendLog("Current district: ${gps.district}")
+        client?.display("Current district: ${gps.district}", DisplayOptions())
+    }
+
+    private fun logErrorReadable(prefix: String, throwable: Throwable?) {
+        val userMessage = humanReadableError(throwable)
+        appendLog("$prefix. $userMessage")
+        Log.e(TAG, "$prefix. $userMessage", throwable)
+    }
+
+    private fun humanReadableError(throwable: Throwable?): String {
+        if (throwable == null) return "Unknown error. Please try again."
+        val message = throwable.message.orEmpty()
+        return when {
+            throwable.javaClass.simpleName.contains("JsonDecoding", ignoreCase = true) ->
+                    "Received unexpected data from server. Please retry in a moment."
+            message.contains("permission", ignoreCase = true) ->
+                    "Permission is missing. Please grant the required permission and retry."
+            message.contains("network", ignoreCase = true) ||
+                    message.contains("timeout", ignoreCase = true) ->
+                    "Network issue detected. Please check connection and retry."
+            message.isNotBlank() -> message
+            else -> "Unexpected error occurred. Please try again."
         }
     }
 
@@ -784,6 +945,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private companion object {
+        const val TAG = "HKRouterPlanner"
         const val KEY_DISTRICT = "district"
         const val KEY_USER_LAT = "user_lat"
         const val KEY_USER_LNG = "user_lng"
@@ -797,12 +959,20 @@ class MainActivity : AppCompatActivity() {
     // ===================================================================
 
     private fun loadEntryOrNull(): UniversalAppEntry? {
-        val cls = try {
-            val appInfo = packageManager.getApplicationInfo(packageName, android.content.pm.PackageManager.GET_META_DATA)
-            appInfo.metaData?.getString("com.universalglasses.app_entry_class")?.trim().orEmpty()
-        } catch (_: Throwable) {
-            ""
-        }
+        val cls =
+                try {
+                    val appInfo =
+                            packageManager.getApplicationInfo(
+                                    packageName,
+                                    android.content.pm.PackageManager.GET_META_DATA
+                            )
+                    appInfo.metaData
+                            ?.getString("com.universalglasses.app_entry_class")
+                            ?.trim()
+                            .orEmpty()
+                } catch (_: Throwable) {
+                    ""
+                }
         if (cls.isBlank()) return null
         return try {
             val k = Class.forName(cls)

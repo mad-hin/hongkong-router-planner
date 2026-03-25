@@ -174,47 +174,58 @@ class HkRouterPlannerEntry : UniversalAppEntrySimple {
         }
     }
 
+    /**
+     * Fetches JSON using native Java HttpURLConnection to avoid Ktor header issues
+     * that trigger 403 on some APIs (e.g., HKO).
+     */
     private suspend fun fetchJsonObject(
-        client: HttpClient,
+        @Suppress("UNUSED_PARAMETER") client: HttpClient,
         url: String,
     ): Result<kotlinx.serialization.json.JsonObject> {
         var lastEx: Throwable? = null
         repeat(3) { attempt ->
-            if (attempt > 0) delay(1_000L)
-            val bodyResult = runCatching {
-                client.get(url) {
-                    // HKO blocks requests that look non-browser; mimic a real browser.
-                    header(HttpHeaders.Accept, "application/json, text/plain, */*")
-                    header(HttpHeaders.AcceptLanguage, "en-US,en;q=0.9")
-                    header(HttpHeaders.CacheControl, "no-cache")
-                    header(HttpHeaders.Referrer, "https://www.hko.gov.hk/")
-                    header(
-                        HttpHeaders.UserAgent,
-                        "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 " +
-                            "(KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
-                    )
-                }.bodyAsText()
+            if (attempt > 0) delay(1_000L + attempt * 500L)
+            val result = runCatching {
+                kotlinx.coroutines.Dispatchers.IO.let { dispatcher ->
+                    kotlinx.coroutines.withContext(dispatcher) {
+                        val connection = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+                        try {
+                            connection.connectTimeout = 30_000
+                            connection.readTimeout = 30_000
+                            connection.requestMethod = "GET"
+                            connection.setRequestProperty("Accept", "application/json")
+                            connection.connect()
+
+                            val status = connection.responseCode
+                            if (status !in 200..299) {
+                                throw IllegalStateException("HTTP $status from $url")
+                            }
+                            connection.inputStream.bufferedReader().use { it.readText() }
+                        } finally {
+                            connection.disconnect()
+                        }
+                    }
+                }
             }
-            if (bodyResult.isFailure) {
-                lastEx = bodyResult.exceptionOrNull()
-                Log.e(TAG, "Fetch attempt ${attempt + 1} network error for $url: ${lastEx?.message}", lastEx)
+            if (result.isFailure) {
+                lastEx = result.exceptionOrNull()
+                Log.e(TAG, "Fetch attempt ${attempt + 1} error for $url: ${lastEx?.message}", lastEx)
                 return@repeat
             }
-            val body = bodyResult.getOrNull() ?: return@repeat
-            val trimmed = body.trimStart()
-            if (!trimmed.startsWith("{")) {
-                // Log the first 400 chars of the body so we can see what the server returned.
-                val preview = trimmed.take(400).replace("\n", " ").replace("\r", "")
-                val msg = "Non-JSON response (attempt ${attempt + 1}) from $url — body: $preview"
-                Log.w(TAG, msg)
-                lastEx = IllegalStateException("Non-JSON response from $url (attempt ${attempt + 1})")
+            val body = result.getOrNull() ?: return@repeat
+            if (body.isBlank()) {
+                lastEx = IllegalStateException("Empty response body from $url")
+                Log.e(TAG, "Fetch attempt ${attempt + 1}: empty response from $url")
                 return@repeat
             }
+            val trimmed = body.replace("\uFEFF", "").trim()
             val parseResult = runCatching { Json.parseToJsonElement(trimmed).jsonObject }
             if (parseResult.isSuccess) {
                 Log.d(TAG, "Fetched $url OK (attempt ${attempt + 1})")
                 return Result.success(parseResult.getOrNull()!!)
             }
+            val preview = trimmed.take(400).replace("\n", " ").replace("\r", "")
+            Log.w(TAG, "Unexpected response body (attempt ${attempt + 1}) from $url: $preview")
             lastEx = parseResult.exceptionOrNull()
             Log.e(TAG, "JSON parse error for $url (attempt ${attempt + 1})", lastEx)
         }

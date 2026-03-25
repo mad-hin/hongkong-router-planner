@@ -7,6 +7,8 @@ import com.aallam.openai.api.chat.ChatRole
 import com.aallam.openai.api.model.ModelId
 import com.aallam.openai.client.OpenAI
 import com.aallam.openai.client.OpenAIHost
+import com.example.hongkongrouterplanner.logic.HkRouterPlannerEntry.Companion.HKO_STATION_COORDS
+import com.example.hongkongrouterplanner.logic.HkRouterPlannerEntry.Companion.HK_DISTRICT_CENTERS
 import com.universalglasses.appcontract.AIApiSettings
 import com.universalglasses.appcontract.UniversalAppContext
 import com.universalglasses.appcontract.UniversalAppEntrySimple
@@ -90,12 +92,11 @@ class HkRouterPlannerEntry : UniversalAppEntrySimple {
                 val currentResult = fetchJsonObject(client, HKO_CURRENT_URL)
                 val forecastResult = fetchJsonObject(client, HKO_FORECAST_URL)
                 if (currentResult.isFailure || forecastResult.isFailure) {
-                    val err = (currentResult.exceptionOrNull() ?: forecastResult.exceptionOrNull())
-                        ?.message ?: "Unknown error"
+                    val err = (currentResult.exceptionOrNull()
+                        ?: forecastResult.exceptionOrNull())?.message ?: "Unknown error"
                     Log.e(TAG, "Weather fetch failed: $err")
                     return ctx.client.display(
-                        "Weather unavailable.\nError: ${err.take(120)}",
-                        DisplayOptions()
+                        "Weather unavailable.\nError: ${err.take(120)}", DisplayOptions()
                     )
                 }
                 val currentJson = currentResult.getOrNull()!!
@@ -103,48 +104,61 @@ class HkRouterPlannerEntry : UniversalAppEntrySimple {
 
                 // Temperature — nearest HKO station to user's GPS, fallback HK Observatory.
                 val tempArr =
-                    currentJson["temperature"]?.jsonObject?.get("data")?.jsonArray ?: JsonArray(emptyList())
-                val tempPlaces = tempArr.mapNotNull { it.jsonObject["place"]?.jsonPrimitive?.contentOrNull }
-                val nearestTempStation = resolveNearestHkoStation(tempPlaces, district, userLat, userLng)
-                Log.d(TAG, "Nearest temp station: $nearestTempStation (user GPS: $userLat, $userLng)")
+                    currentJson["temperature"]?.jsonObject?.get("data")?.jsonArray ?: JsonArray(
+                        emptyList()
+                    )
+                val tempPlaces =
+                    tempArr.mapNotNull { it.jsonObject["place"]?.jsonPrimitive?.contentOrNull }
+                val nearestTempStation =
+                    resolveNearestHkoStation(tempPlaces, district, userLat, userLng)
+                Log.d(
+                    TAG, "Nearest temp station: $nearestTempStation (user GPS: $userLat, $userLng)"
+                )
 
                 val temp = tempArr.firstOrNull {
-                        it.jsonObject["place"]?.jsonPrimitive?.contentOrNull == nearestTempStation
-                    }?.jsonObject?.get("value")?.jsonPrimitive?.intOrNull
-                    ?: tempArr.firstOrNull {
-                        normalizeDistrict(it.jsonObject["place"]?.jsonPrimitive?.contentOrNull) ==
-                            normalizeDistrict(nearestTempStation)
-                    }?.jsonObject?.get("value")?.jsonPrimitive?.intOrNull
-                    ?: tempArr.firstOrNull {
-                        it.jsonObject["place"]?.jsonPrimitive?.content == "Hong Kong Observatory"
-                    }?.jsonObject?.get("value")?.jsonPrimitive?.intOrNull
+                    it.jsonObject["place"]?.jsonPrimitive?.contentOrNull == nearestTempStation
+                }?.jsonObject?.get("value")?.jsonPrimitive?.intOrNull ?: tempArr.firstOrNull {
+                    normalizeDistrict(it.jsonObject["place"]?.jsonPrimitive?.contentOrNull) == normalizeDistrict(
+                        nearestTempStation
+                    )
+                }?.jsonObject?.get("value")?.jsonPrimitive?.intOrNull ?: tempArr.firstOrNull {
+                    it.jsonObject["place"]?.jsonPrimitive?.content == "Hong Kong Observatory"
+                }?.jsonObject?.get("value")?.jsonPrimitive?.intOrNull
 
                 val rainfallArr =
-                    currentJson["rainfall"]?.jsonObject?.get("data")?.jsonArray ?: JsonArray(emptyList())
-                val rainfallPlaces = rainfallArr.mapNotNull { it.jsonObject["place"]?.jsonPrimitive?.contentOrNull }
-                val nearestRainfallStation = resolveNearestHkoStation(rainfallPlaces, district, userLat, userLng)
+                    currentJson["rainfall"]?.jsonObject?.get("data")?.jsonArray ?: JsonArray(
+                        emptyList()
+                    )
+                val rainfallPlaces =
+                    rainfallArr.mapNotNull { it.jsonObject["place"]?.jsonPrimitive?.contentOrNull }
+                val nearestRainfallStation =
+                    resolveNearestHkoStation(rainfallPlaces, district, userLat, userLng)
                 Log.d(TAG, "Nearest rainfall station: $nearestRainfallStation")
 
                 val rainfallDistrict = rainfallArr.firstOrNull { entry ->
                     val place = entry.jsonObject["place"]?.jsonPrimitive?.contentOrNull
-                    place == nearestRainfallStation ||
-                        normalizeDistrict(place) == normalizeDistrict(nearestRainfallStation)
+                    place == nearestRainfallStation || normalizeDistrict(place) == normalizeDistrict(
+                        nearestRainfallStation
+                    )
                 }?.jsonObject
                 val rainfallMax = rainfallDistrict?.get("max")?.jsonPrimitive?.intOrNull
 
                 val humidity =
                     currentJson["humidity"]?.jsonObject?.get("data")?.jsonArray?.firstOrNull()?.jsonObject?.get(
-                            "value"
-                        )?.jsonPrimitive?.intOrNull
+                        "value"
+                    )?.jsonPrimitive?.intOrNull
 
-                val uvDesc =
-                    currentJson["uvindex"]?.jsonObject?.get("data")?.jsonArray?.firstOrNull()?.jsonObject?.get(
-                            "desc"
-                        )?.jsonPrimitive?.contentOrNull
+                val uvDesc = currentJson["uvindex"]?.let { uv ->
+                    if (uv is kotlinx.serialization.json.JsonObject) {
+                        uv["data"]?.jsonArray?.firstOrNull()?.jsonObject?.get("desc")?.jsonPrimitive?.contentOrNull
+                    } else null
+                }
 
-                val warnings =
-                    currentJson["warningMessage"]?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull }
-                        ?.filter { it.isNotBlank() } ?: emptyList()
+                val warnings = currentJson["warningMessage"]?.let { wm ->
+                    if (wm is JsonArray) {
+                        wm.mapNotNull { it.jsonPrimitive.contentOrNull }.filter { it.isNotBlank() }
+                    } else null
+                } ?: emptyList()
 
                 val forecastPeriod = forecastJson["forecastPeriod"]?.jsonPrimitive?.content ?: ""
                 val forecastDesc = forecastJson["forecastDesc"]?.jsonPrimitive?.content ?: ""
@@ -188,7 +202,8 @@ class HkRouterPlannerEntry : UniversalAppEntrySimple {
             val result = runCatching {
                 kotlinx.coroutines.Dispatchers.IO.let { dispatcher ->
                     kotlinx.coroutines.withContext(dispatcher) {
-                        val connection = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+                        val connection =
+                            java.net.URL(url).openConnection() as java.net.HttpURLConnection
                         try {
                             connection.connectTimeout = 30_000
                             connection.readTimeout = 30_000
@@ -209,7 +224,9 @@ class HkRouterPlannerEntry : UniversalAppEntrySimple {
             }
             if (result.isFailure) {
                 lastEx = result.exceptionOrNull()
-                Log.e(TAG, "Fetch attempt ${attempt + 1} error for $url: ${lastEx?.message}", lastEx)
+                Log.e(
+                    TAG, "Fetch attempt ${attempt + 1} error for $url: ${lastEx?.message}", lastEx
+                )
                 return@repeat
             }
             val body = result.getOrNull() ?: return@repeat
@@ -252,25 +269,33 @@ class HkRouterPlannerEntry : UniversalAppEntrySimple {
 
         // 1. Normalised name match with user's known district
         val normalizedFallback = normalizeDistrict(fallbackDistrict)
-        availablePlaces.firstOrNull { normalizeDistrict(it) == normalizedFallback }?.let { return it }
+        availablePlaces.firstOrNull { normalizeDistrict(it) == normalizedFallback }
+            ?.let { return it }
 
         if (userLat != null && userLng != null) {
             val userPos = LatLng(userLat, userLng)
 
             // 2. GPS → nearest HKO named station present in the response
-            val nearest = availablePlaces
-                .mapNotNull { place -> HKO_STATION_COORDS[place]?.let { coords -> place to coords } }
-                .minByOrNull { (_, coords) -> distanceMeters(userPos, coords) }
+            val nearest =
+                availablePlaces.mapNotNull { place -> HKO_STATION_COORDS[place]?.let { coords -> place to coords } }
+                    .minByOrNull { (_, coords) -> distanceMeters(userPos, coords) }
             if (nearest != null) {
-                Log.d(TAG, "GPS matched HKO station: ${nearest.first} (" +
-                    "${distanceMeters(userPos, nearest.second).toLong()}m from user)")
+                Log.d(
+                    TAG, "GPS matched HKO station: ${nearest.first} (" + "${
+                        distanceMeters(
+                            userPos, nearest.second
+                        ).toLong()
+                    }m from user)"
+                )
                 return nearest.first
             }
 
             // 3. Fall back to admin district boundary → normalised name match
-            val nearestDistrict = HK_DISTRICT_CENTERS.entries
-                .minByOrNull { (_, center) -> distanceMeters(userPos, center) }?.key
-                ?: return fallbackDistrict
+            val nearestDistrict = HK_DISTRICT_CENTERS.entries.minByOrNull { (_, center) ->
+                distanceMeters(
+                    userPos, center
+                )
+            }?.key ?: return fallbackDistrict
             availablePlaces.firstOrNull {
                 normalizeDistrict(it) == normalizeDistrict(nearestDistrict)
             }?.let { return it }
@@ -369,20 +394,20 @@ class HkRouterPlannerEntry : UniversalAppEntrySimple {
 
                 val start = LatLng(startLat, startLng)
                 val allJourneys = targetPoints.flatMap { end ->
-                        routeSearchP2P(
-                            routeList = routeList,
-                            stopList = stopList,
-                            start = start,
-                            end = end,
-                            maxDepth = 2,
-                        )
-                    }.distinctBy { path ->
-                        path.joinToString("|") {
-                            "${it.routeId}/${it.on}-${it.off}"
-                        }
-                    }.sortedWith(compareBy<List<RouteLeg>> { it.size }.thenBy {
-                        it.sumOf { leg -> leg.off - leg.on }
-                    }).take(3)
+                    routeSearchP2P(
+                        routeList = routeList,
+                        stopList = stopList,
+                        start = start,
+                        end = end,
+                        maxDepth = 2,
+                    )
+                }.distinctBy { path ->
+                    path.joinToString("|") {
+                        "${it.routeId}/${it.on}-${it.off}"
+                    }
+                }.sortedWith(compareBy<List<RouteLeg>> { it.size }.thenBy {
+                    it.sumOf { leg -> leg.off - leg.on }
+                }).take(3)
 
                 if (allJourneys.isEmpty()) {
                     return ctx.client.display(
@@ -453,12 +478,12 @@ class HkRouterPlannerEntry : UniversalAppEntrySimple {
         val db = runCatching {
             Json.parseToJsonElement(client.get(HK_ETA_DB_URL).bodyAsText()).jsonObject
         }.getOrElse {
-                runCatching {
-                    Json.parseToJsonElement(
-                        client.get(HK_ETA_DB_FALLBACK_URL).bodyAsText()
-                    ).jsonObject
-                }.getOrNull() ?: return null
-            }
+            runCatching {
+                Json.parseToJsonElement(
+                    client.get(HK_ETA_DB_FALLBACK_URL).bodyAsText()
+                ).jsonObject
+            }.getOrNull() ?: return null
+        }
 
         val routeList = db["routeList"]?.jsonObject ?: return null
         val stopList = db["stopList"]?.jsonObject ?: return null
@@ -474,21 +499,21 @@ class HkRouterPlannerEntry : UniversalAppEntrySimple {
         val queryWords = query.split(" ", ",", ".", "-").filter { it.length >= 2 }
 
         return stopList.values.mapNotNull { stopEl ->
-                val stopObj = stopEl.jsonObject
-                val nameObj = stopObj["name"]?.jsonObject ?: return@mapNotNull null
-                val en = nameObj["en"]?.jsonPrimitive?.contentOrNull?.lowercase().orEmpty()
-                val zh = nameObj["zh"]?.jsonPrimitive?.contentOrNull?.lowercase().orEmpty()
-                val loc = stopObj["location"]?.jsonObject ?: return@mapNotNull null
-                val lat = loc["lat"]?.jsonPrimitive?.doubleOrNull ?: return@mapNotNull null
-                val lng = loc["lng"]?.jsonPrimitive?.doubleOrNull ?: return@mapNotNull null
+            val stopObj = stopEl.jsonObject
+            val nameObj = stopObj["name"]?.jsonObject ?: return@mapNotNull null
+            val en = nameObj["en"]?.jsonPrimitive?.contentOrNull?.lowercase().orEmpty()
+            val zh = nameObj["zh"]?.jsonPrimitive?.contentOrNull?.lowercase().orEmpty()
+            val loc = stopObj["location"]?.jsonObject ?: return@mapNotNull null
+            val lat = loc["lat"]?.jsonPrimitive?.doubleOrNull ?: return@mapNotNull null
+            val lng = loc["lng"]?.jsonPrimitive?.doubleOrNull ?: return@mapNotNull null
 
-                val score = when {
-                    en.contains(query) || zh.contains(query) -> 200
-                    else -> queryWords.count { en.contains(it) || zh.contains(it) } * 20
-                }
-                if (score <= 0) return@mapNotNull null
-                score to LatLng(lat, lng)
-            }.sortedByDescending { it.first }.map { it.second }.take(3)
+            val score = when {
+                en.contains(query) || zh.contains(query) -> 200
+                else -> queryWords.count { en.contains(it) || zh.contains(it) } * 20
+            }
+            if (score <= 0) return@mapNotNull null
+            score to LatLng(lat, lng)
+        }.sortedByDescending { it.first }.map { it.second }.take(3)
     }
 
     private fun routeSearchP2P(
@@ -612,11 +637,11 @@ class HkRouterPlannerEntry : UniversalAppEntrySimple {
                         val nextStopId = stops[idx]
                         val nextLoc =
                             stopList[nextStopId]?.jsonObject?.get("location")?.jsonObject?.let { loc ->
-                                    val lat = loc["lat"]?.jsonPrimitive?.doubleOrNull
-                                    val lng = loc["lng"]?.jsonPrimitive?.doubleOrNull
-                                    if (lat != null && lng != null) LatLng(lat, lng)
-                                    else null
-                                } ?: continue
+                                val lat = loc["lat"]?.jsonPrimitive?.doubleOrNull
+                                val lng = loc["lng"]?.jsonPrimitive?.doubleOrNull
+                                if (lat != null && lng != null) LatLng(lat, lng)
+                                else null
+                            } ?: continue
 
                         if (dfs(
                                 curLocation = nextLoc,
@@ -817,17 +842,18 @@ User is near $district. Reply with ONLY the route number (e.g. 1, 1A, 234X). Not
             header(HttpHeaders.Authorization, "Bearer $apiKey")
             setBody(
                 MultiPartFormDataContent(
-                formData {
-                    append("model", "whisper-1")
-                    append("language", "en")
-                    append(
-                        "file", wav, Headers.build {
-                            append(HttpHeaders.ContentType, "audio/wav")
-                            append(
-                                HttpHeaders.ContentDisposition, "filename=\"audio.wav\""
-                            )
-                        })
-                }))
+                    formData {
+                        append("model", "whisper-1")
+                        append("language", "en")
+                        append(
+                            "file", wav, Headers.build {
+                                append(HttpHeaders.ContentType, "audio/wav")
+                                append(
+                                    HttpHeaders.ContentDisposition, "filename=\"audio.wav\""
+                                )
+                            })
+                    })
+            )
         }
         return Json.parseToJsonElement(resp.bodyAsText()).jsonObject["text"]?.jsonPrimitive?.contentOrNull
             ?: ""

@@ -89,6 +89,8 @@ class MainActivity : AppCompatActivity() {
     private var connectJob: Job? = null
     private var stateJob: Job? = null
     private var eventsJob: Job? = null
+    /** Currently running command job — cancelled when a new command starts. */
+    private var commandJob: Job? = null
     private var pendingConnectModel: GlassesModel? = null
     /** Action to run once location permissions are granted (set by GPS-dependent commands). */
     private var pendingGpsCommand: (suspend () -> Unit)? = null
@@ -627,7 +629,9 @@ class MainActivity : AppCompatActivity() {
                     Button(this).apply {
                         text = cmd.title
                         setOnClickListener {
-                            scope.launch {
+                            // Cancel any currently running command
+                            commandJob?.cancel()
+                            commandJob = scope.launch {
                                 // GPS-dependent commands: check permissions first, request if needed
                                 val needsGps = cmd.id == "bus_eta" || cmd.id == "plan_route"
                                 if (needsGps) {

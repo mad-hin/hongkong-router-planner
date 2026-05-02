@@ -164,24 +164,51 @@ class HkRouterPlannerEntry : UniversalAppEntrySimple {
                 val forecastDesc = forecastJson["forecastDesc"]?.jsonPrimitive?.content ?: ""
                 val outlook = forecastJson["outlook"]?.jsonPrimitive?.content ?: ""
 
-                ctx.client.display(buildString {
-                    appendLine("=== HK Weather ===")
-                    appendLine("Station: $nearestTempStation")
-                    temp?.let { appendLine("Temp: ${it}°C") }
-                    rainfallMax?.let { appendLine("Rainfall: ${it}mm") }
-                    humidity?.let { appendLine("Humidity: ${it}%") }
-                    uvDesc?.let { appendLine("UV: $it") }
-                    if (warnings.isNotEmpty()) appendLine("⚠ ${warnings.joinToString("; ")}")
+                // Build display lines, then paginate to fit glasses display
+                val lines = buildList {
+                    add("=== HK Weather ===")
+                    add("Station: $nearestTempStation")
+                    temp?.let { add("Temp: ${it}°C") }
+                    rainfallMax?.let { add("Rainfall: ${it}mm") }
+                    humidity?.let { add("Humidity: ${it}%") }
+                    uvDesc?.let { add("UV: $it") }
+                    if (warnings.isNotEmpty()) {
+                        warnings.forEach { add("⚠ $it") }
+                    }
                     if (forecastPeriod.isNotBlank()) {
-                        appendLine()
-                        appendLine(forecastPeriod)
+                        add("")
+                        add(forecastPeriod)
                     }
-                    if (forecastDesc.isNotBlank()) appendLine(forecastDesc.take(180))
+                    if (forecastDesc.isNotBlank()) {
+                        // Split long forecast text into chunks that fit a line
+                        forecastDesc.chunked(40).forEach { add(it.trim()) }
+                    }
                     if (outlook.isNotBlank()) {
-                        appendLine()
-                        append("Outlook: ${outlook.take(130)}")
+                        add("")
+                        add("Outlook:")
+                        outlook.chunked(40).forEach { add(it.trim()) }
                     }
-                }.trim(), DisplayOptions())
+                }
+
+                val pageSize = 8
+                val pages = lines.chunked(pageSize)
+                pages.forEachIndexed { idx, pageLines ->
+                    val displayText = buildString {
+                        if (pages.size > 1) {
+                            appendLine("Weather (${idx + 1}/${pages.size})")
+                        }
+                        pageLines.forEach { appendLine(it) }
+                        if (idx < pages.lastIndex) {
+                            appendLine()
+                            appendLine("(next in 5s...)")
+                        }
+                    }.trim()
+                    ctx.client.display(displayText, DisplayOptions())
+                    if (idx < pages.lastIndex) {
+                        delay(5_000L)
+                    }
+                }
+                Result.success(Unit)
             } finally {
                 client.close()
             }
@@ -745,7 +772,9 @@ class HkRouterPlannerEntry : UniversalAppEntrySimple {
                 val userPos = LatLng(userLat, userLng)
 
                 // Find stops within 1.5km radius
-                val nearbyStops = stopList.entries
+                val totalStops = stopList.size
+                Log.d(TAG, "Searching $totalStops stops near ($userLat, $userLng), radius=${NEARBY_STOP_RADIUS_M}m")
+                val stopDistances = stopList.entries
                     .mapNotNull { (stopId, stopEl) ->
                         val stopObj = stopEl.jsonObject
                         val nameObj = stopObj["name"]?.jsonObject ?: return@mapNotNull null
@@ -755,16 +784,25 @@ class HkRouterPlannerEntry : UniversalAppEntrySimple {
                         val lng = loc["lng"]?.jsonPrimitive?.doubleOrNull ?: return@mapNotNull null
 
                         val distance = distanceMeters(userPos, LatLng(lat, lng))
-                        if (distance <= NEARBY_STOP_RADIUS_M) {
-                            Triple(stopId, en, distance)
-                        } else null
+                        Triple(stopId, en, distance)
                     }
+
+                // Log closest 3 stops for debugging
+                stopDistances.sortedBy { it.third }.take(3).forEach { (id, name, dist) ->
+                    Log.d(TAG, "Stop: $name (${dist.toInt()}m)")
+                }
+
+                val nearbyStops = stopDistances
+                    .filter { it.third <= NEARBY_STOP_RADIUS_M }
                     .sortedBy { it.third }
                     .take(5)
 
                 if (nearbyStops.isEmpty()) {
+                    val closestDist = stopDistances.minOfOrNull { it.third }?.toInt() ?: 0
+                    Log.w(TAG, "No stops within ${NEARBY_STOP_RADIUS_M.toInt()}m. Closest stop: ${closestDist}m. GPS: $userLat, $userLng")
                     return ctx.client.display(
-                        "No bus stops within 1.5km of your location.", DisplayOptions()
+                        "No bus stops within 1.5km.\nGPS: ${"%.4f".format(userLat)}, ${"%.4f".format(userLng)}\nClosest: ${closestDist}m away",
+                        DisplayOptions()
                     )
                 }
 
@@ -782,71 +820,131 @@ class HkRouterPlannerEntry : UniversalAppEntrySimple {
                     }
                 }
 
-                // Stream updates every 5 seconds
-                repeat(12) { iteration ->
-                    val displayText = buildString {
-                        appendLine("=== Live Bus ETA (${(iteration) * 5}s) ===")
-                        appendLine()
+                // Build all route display lines (sorted by route number)
+                val allRouteLines = mutableListOf<String>()
+                nearbyStops.forEach { (stopId, stopName, distance) ->
+                    allRouteLines.add("📍 $stopName (${distance.toInt()}m)")
+                    val routeIds = stopRoutes[stopId] ?: emptySet()
 
-                        nearbyStops.forEach { (stopId, stopName, distance) ->
-                            appendLine("📍 $stopName (${distance.toInt()}m)")
-                            val routeIds = stopRoutes[stopId] ?: emptySet()
+                    if (routeIds.isEmpty()) {
+                        allRouteLines.add("  No routes")
+                    } else {
+                        val etaLines = routeIds.sortedBy { rid ->
+                            routeList[rid]?.jsonObject?.get("route")?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: 9999
+                        }.mapNotNull { routeId ->
+                            val routeObj = routeList[routeId]?.jsonObject ?: return@mapNotNull null
+                            val routeNo = routeObj["route"]?.jsonPrimitive?.contentOrNull
+                                ?: return@mapNotNull null
+                            val svcType = routeObj["serviceType"]?.jsonPrimitive?.contentOrNull ?: "1"
+                            val companies = routeObj["co"]?.jsonArray?.mapNotNull {
+                                it.jsonPrimitive.contentOrNull
+                            } ?: emptyList()
+                            val primaryCo = companies.firstOrNull()
+                            val routeDest = routeObj["dest"]?.jsonObject?.get("en")
+                                ?.jsonPrimitive?.contentOrNull ?: ""
 
-                            if (routeIds.isEmpty()) {
-                                appendLine("  No routes")
-                            } else {
-                                val etaLines = routeIds.sortedBy { rid ->
-                                    // Sort by route number for readability
-                                    routeList[rid]?.jsonObject?.get("route")?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: 9999
-                                }.mapNotNull { routeId ->
-                                    val routeObj = routeList[routeId]?.jsonObject
-                                        ?: return@mapNotNull null
-                                    val routeNo = routeObj["route"]?.jsonPrimitive?.contentOrNull
-                                        ?: return@mapNotNull null
-                                    val svcType =
-                                        routeObj["serviceType"]?.jsonPrimitive?.contentOrNull
-                                            ?: "1"
-                                    val companies = routeObj["co"]?.jsonArray?.mapNotNull {
-                                        it.jsonPrimitive.contentOrNull
-                                    } ?: emptyList()
-                                    val primaryCo = companies.firstOrNull()
-                                    val routeDest = routeObj["dest"]?.jsonObject?.get("en")
-                                        ?.jsonPrimitive?.contentOrNull ?: ""
-
-                                    // Route type icon
-                                    val icon = when (primaryCo) {
-                                        "gmb" -> "🚐"
-                                        "kmb", "ctb", "nlb", "lrtfeeder" -> "🚌"
-                                        "mtr" -> "🚇"
-                                        "lightRail" -> "🚋"
-                                        "fortuneferry", "hkkf", "sunferry" -> "⛴️"
-                                        else -> "🚌"
-                                    }
-                                    val typeLabel = when (primaryCo) {
-                                        "gmb" -> "Minibus"
-                                        else -> "Bus"
-                                    }
-
-                                    val etaInfo = runCatching {
-                                        fetchNearestEta(client, stopId, routeNo, svcType, primaryCo)
-                                    }.getOrNull() ?: "—"
-
-                                    val destStr = if (routeDest.isNotBlank()) " → $routeDest" else ""
-                                    "$icon $typeLabel $routeNo$destStr: $etaInfo"
-                                }
-                                etaLines.forEach { appendLine(it) }
+                            val icon = when (primaryCo) {
+                                "gmb" -> "🚐"
+                                "kmb", "ctb", "nlb", "lrtfeeder" -> "🚌"
+                                "mtr" -> "🚇"
+                                "lightRail" -> "🚋"
+                                "fortuneferry", "hkkf", "sunferry" -> "⛴️"
+                                else -> "🚌"
                             }
-                            appendLine()
-                        }
+                            val typeLabel = when (primaryCo) {
+                                "gmb" -> "Minibus"
+                                else -> "Bus"
+                            }
 
-                        appendLine("(Updates every 5 seconds)")
-                        appendLine("🚌 Bus  🚐 Minibus  🚇 MTR  🚋 Light Rail  ⛴ Ferry")
+                            val etaInfo = runCatching {
+                                fetchNearestEta(client, stopId, routeNo, svcType, primaryCo)
+                            }.getOrNull() ?: "—"
+
+                            val destStr = if (routeDest.isNotBlank()) " → $routeDest" else ""
+                            " $icon $typeLabel $routeNo$destStr: $etaInfo"
+                        }
+                        allRouteLines.addAll(etaLines)
+                    }
+                    allRouteLines.add("")  // blank separator between stops
+                }
+
+                // Footer legend
+                val footerLine = "🚌Bus 🚐Minibus 🚇MTR 🚋LR ⛴Ferry"
+
+                // Paginate: split into pages of PAGE_SIZE lines, cycle every 5s
+                val pageSize = 8
+                // Remove trailing blank line if present
+                while (allRouteLines.lastOrNull().isNullOrBlank()) allRouteLines.removeLastOrNull()
+
+                // Rotate through pages, refreshing ETA data on each full cycle
+                val maxCycles = 6  // 6 cycles × refresh = ~60s total
+                repeat(maxCycles) { cycle ->
+                    // Refresh ETA data for this cycle
+                    val refreshedLines = allRouteLines.toMutableList()
+                    var lineIdx = 0
+                    nearbyStops.forEach { (stopId, _, _) ->
+                        // Skip the header line (it's the stop name line)
+                        lineIdx++ // skip "📍 StopName..."
+                        val routeIds = stopRoutes[stopId] ?: emptySet()
+                        if (routeIds.isNotEmpty()) {
+                            routeIds.sortedBy { rid ->
+                                routeList[rid]?.jsonObject?.get("route")?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: 9999
+                            }.forEach { routeId ->
+                                val routeObj = routeList[routeId]?.jsonObject ?: return@forEach
+                                val routeNo = routeObj["route"]?.jsonPrimitive?.contentOrNull ?: return@forEach
+                                val svcType = routeObj["serviceType"]?.jsonPrimitive?.contentOrNull ?: "1"
+                                val companies = routeObj["co"]?.jsonArray?.mapNotNull {
+                                    it.jsonPrimitive.contentOrNull
+                                } ?: emptyList()
+                                val primaryCo = companies.firstOrNull()
+                                val routeDest = routeObj["dest"]?.jsonObject?.get("en")
+                                    ?.jsonPrimitive?.contentOrNull ?: ""
+                                val icon = when (primaryCo) {
+                                    "gmb" -> "🚐"
+                                    "kmb", "ctb", "nlb", "lrtfeeder" -> "🚌"
+                                    "mtr" -> "🚇"
+                                    "lightRail" -> "🚋"
+                                    "fortuneferry", "hkkf", "sunferry" -> "⛴️"
+                                    else -> "🚌"
+                                }
+                                val typeLabel = when (primaryCo) { "gmb" -> "Minibus" else -> "Bus" }
+                                val etaInfo = runCatching {
+                                    fetchNearestEta(client, stopId, routeNo, svcType, primaryCo)
+                                }.getOrNull() ?: "—"
+                                val destStr = if (routeDest.isNotBlank()) " → $routeDest" else ""
+                                if (lineIdx in refreshedLines.indices) {
+                                    refreshedLines[lineIdx] = " $icon $typeLabel $routeNo$destStr: $etaInfo"
+                                }
+                                lineIdx++
+                            }
+                        }
+                        // Skip blank separator
+                        if (lineIdx in refreshedLines.indices && refreshedLines[lineIdx].isBlank()) {
+                            lineIdx++
+                        }
                     }
 
-                    ctx.client.display(displayText, DisplayOptions())
+                    val pages = refreshedLines.chunked(pageSize)
+                    if (pages.isEmpty()) {
+                        ctx.client.display("No routes available.", DisplayOptions())
+                        return@repeat
+                    }
 
-                    if (iteration < 11) {
-                        delay(5_000L)
+                    pages.forEachIndexed { pageNum, pageLines ->
+                        val elapsed = (cycle * pages.size + pageNum) * 5
+                        val displayText = buildString {
+                            appendLine("=== ETA ${elapsed}s (pg ${pageNum + 1}/${pages.size}) ===")
+                            pageLines.forEach { appendLine(it) }
+                            if (pageNum == pages.lastIndex) {
+                                appendLine(footerLine)
+                            } else {
+                                appendLine("(next page in 5s...)")
+                            }
+                        }
+                        ctx.client.display(displayText, DisplayOptions())
+                        if (cycle < maxCycles - 1 || pageNum < pages.lastIndex) {
+                            delay(5_000L)
+                        }
                     }
                 }
 
@@ -1020,7 +1118,7 @@ class HkRouterPlannerEntry : UniversalAppEntrySimple {
             "https://hkbus.github.io/hk-bus-crawling/routeFareList.min.json"
         private const val TAG = "HkRouterPlanner"
         private const val WALKING_RADIUS_M = 500.0
-        private const val NEARBY_STOP_RADIUS_M = 1_500.0
+        private const val NEARBY_STOP_RADIUS_M = 2000.0
 
         /**
          * Coordinates of HKO automatic weather stations, keyed by the exact place name

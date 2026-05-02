@@ -90,6 +90,8 @@ class MainActivity : AppCompatActivity() {
     private var stateJob: Job? = null
     private var eventsJob: Job? = null
     private var pendingConnectModel: GlassesModel? = null
+    /** Action to run once location permissions are granted (set by GPS-dependent commands). */
+    private var pendingGpsCommand: (suspend () -> Unit)? = null
     private var externalActivityContinuation:
             kotlinx.coroutines.CancellableContinuation<ExternalActivityResult>? =
             null
@@ -106,14 +108,33 @@ class MainActivity : AppCompatActivity() {
                             "Permission required: please grant $deniedFriendly in the system prompt or Settings."
                     )
                     tvStatus.text = "Status: permission needed"
+
+                    // Check if location permission was denied
+                    val locationDenied = denied.any {
+                        it == Manifest.permission.ACCESS_FINE_LOCATION ||
+                        it == Manifest.permission.ACCESS_COARSE_LOCATION
+                    }
+
                     pendingConnectModel = null
+                    pendingGpsCommand = null
                     scope.launch { announceCurrentDistrict() }
+
+                    // Open app settings to allow user to grant permissions
+                    if (locationDenied) {
+                        openAppSettings()
+                    }
                     return@registerForActivityResult
                 }
                 scope.launch { announceCurrentDistrict() }
                 val model = pendingConnectModel
                 pendingConnectModel = null
                 if (model != null) connect(model)
+                // Run any pending GPS-dependent command that was waiting for permissions
+                val pendingCmd = pendingGpsCommand
+                pendingGpsCommand = null
+                if (pendingCmd != null) {
+                    scope.launch { pendingCmd() }
+                }
             }
 
     private val externalActivityLauncher =
@@ -607,6 +628,55 @@ class MainActivity : AppCompatActivity() {
                         text = cmd.title
                         setOnClickListener {
                             scope.launch {
+                                // GPS-dependent commands: check permissions first, request if needed
+                                val needsGps = cmd.id == "bus_eta" || cmd.id == "plan_route"
+                                if (needsGps) {
+                                    val hasFine = ContextCompat.checkSelfPermission(
+                                        this@MainActivity, Manifest.permission.ACCESS_FINE_LOCATION
+                                    ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                                    val hasCoarse = ContextCompat.checkSelfPermission(
+                                        this@MainActivity, Manifest.permission.ACCESS_COARSE_LOCATION
+                                    ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                                    if (!hasFine && !hasCoarse) {
+                                        appendLog("Location permission needed for ${cmd.title}.")
+                                        // Save command action to retry after permission grant
+                                        pendingGpsCommand = {
+                                            try {
+                                                val ctx = UniversalAppContext(
+                                                    environment = env,
+                                                    client = client!!,
+                                                    scope = scope,
+                                                    log = { appendLog(it) },
+                                                    onCapturedImage = { img ->
+                                                        val bytes = img.jpegBytes
+                                                        if (bytes.isNotEmpty()) {
+                                                            scope.launch {
+                                                                val bmp = withContext(Dispatchers.Default) {
+                                                                    BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                                                                }
+                                                                if (bmp != null) ivPreview.setImageBitmap(bmp)
+                                                            }
+                                                        }
+                                                    },
+                                                    settings = appliedSettings + resolveGpsSnapshot().toSettingsMap(),
+                                                )
+                                                val r = cmd.run(ctx)
+                                                if (r.isFailure) {
+                                                    logErrorReadable("Command failed: ${cmd.title}", r.exceptionOrNull())
+                                                }
+                                            } catch (e: Exception) {
+                                                logErrorReadable("Command error: ${cmd.title}", e)
+                                            }
+                                        }
+                                        requestPermissionsLauncher.launch(
+                                            arrayOf(
+                                                Manifest.permission.ACCESS_FINE_LOCATION,
+                                                Manifest.permission.ACCESS_COARSE_LOCATION,
+                                            )
+                                        )
+                                        return@launch
+                                    }
+                                }
                                 try {
                                     val ctx =
                                             UniversalAppContext(
@@ -941,6 +1011,20 @@ class MainActivity : AppCompatActivity() {
                 val idx = it.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
                 if (idx >= 0) it.getString(idx) else null
             } else null
+        }
+    }
+
+    /** Open the app's Settings page so user can grant permissions. */
+    private fun openAppSettings() {
+        val intent = Intent().apply {
+            action = android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS
+            data = Uri.fromParts("package", packageName, null)
+        }
+        try {
+            startActivity(intent)
+            appendLog("Opened Settings. Please grant Location permission.")
+        } catch (e: Exception) {
+            appendLog("Could not open Settings: ${e.message}")
         }
     }
 

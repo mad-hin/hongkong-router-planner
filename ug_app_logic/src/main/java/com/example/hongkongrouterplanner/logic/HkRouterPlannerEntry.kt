@@ -52,7 +52,7 @@ import kotlin.math.sqrt
  * Commands:
  * 1. Weather Report — current HKO conditions + forecast for your district
  * 2. Plan My Route — record voice destination → AI route suggestion + live KMB ETA
- * 3. Live Bus ETA — say a bus number → get nearest-stop ETA from KMB
+ * 3. Live Bus ETA — show all nearby bus stops within 1.5km with real-time ETA for all routes, streaming every 5 seconds
  *
  * Settings (configure in the host app):
  * - AI API key / base URL / model (OpenAI-compatible)
@@ -368,7 +368,7 @@ class HkRouterPlannerEntry : UniversalAppEntrySimple {
 
                 if (startLat == null || startLng == null) {
                     return ctx.client.display(
-                        "GPS location unavailable. Please allow Location permission and try again.",
+                        "Location access required.\n\nPlease:\n1. Go to Settings\n2. Enable Location permission\n3. Try again",
                         DisplayOptions()
                     )
                 }
@@ -713,7 +713,7 @@ class HkRouterPlannerEntry : UniversalAppEntrySimple {
     }
 
     // ───────────────────────────────────────────────────────────────────────
-    // COMMAND 3 — LIVE BUS ETA (say a bus number)
+    // COMMAND 3 — LIVE BUS ETA (nearest stops, all routes, streaming updates)
     // ───────────────────────────────────────────────────────────────────────
 
     private fun etaCommand() = object : UniversalCommand {
@@ -721,102 +721,136 @@ class HkRouterPlannerEntry : UniversalAppEntrySimple {
         override val title = "Live Bus ETA"
 
         override suspend fun run(ctx: UniversalAppContext): Result<Unit> {
-            val district = ctx.settings[KEY_DISTRICT] ?: "Tsim Sha Tsui"
-            val apiKey = AIApiSettings.apiKey(ctx.settings)
-            val baseUrl = AIApiSettings.baseUrl(ctx.settings)
-            val model = AIApiSettings.model(ctx.settings)
+            val userLat = ctx.settings[KEY_USER_LAT]?.toDoubleOrNull()
+            val userLng = ctx.settings[KEY_USER_LNG]?.toDoubleOrNull()
 
-            if (apiKey.isBlank()) {
+            if (userLat == null || userLng == null) {
                 return ctx.client.display(
-                    "Please set your AI API key in Settings.", DisplayOptions()
-                )
-            }
-            if (!ctx.client.capabilities.canRecordAudio) {
-                return ctx.client.display(
-                    "Microphone not available on this device.", DisplayOptions()
+                    "Location access required.\n\nPlease:\n1. Go to Settings\n2. Enable Location permission\n3. Try again",
+                    DisplayOptions()
                 )
             }
 
-            ctx.client.display("Say a bus number…\n(5-second recording)", DisplayOptions())
-            val session = ctx.client.startMicrophone().getOrElse { e ->
-                return ctx.client.display(
-                    "Mic error: ${e.message}", DisplayOptions()
-                )
-            }
-            val chunks = withTimeoutOrNull(5_000L) { session.audio.toList() } ?: emptyList()
-            session.stop()
-
-            if (chunks.isEmpty()) {
-                return ctx.client.display("No audio captured. Try again.", DisplayOptions())
-            }
-
-            ctx.client.display("Processing…", DisplayOptions())
-            val wav = buildWav(
-                chunks.flatMap { it.bytes.toList() }.toByteArray(), session.format
-            )
-
+            ctx.client.display("Fetching nearby bus stops…", DisplayOptions())
             val client = HttpClient()
             return try {
-                val voiceText = whisperTranscribe(client, wav, apiKey, baseUrl).trim()
-                if (voiceText.isBlank()) {
+                val etaDb = fetchEtaDb(client)
+                if (etaDb == null) {
                     return ctx.client.display(
-                        "No speech detected. Try again.", DisplayOptions()
+                        "Route database unavailable right now. Please try again.", DisplayOptions()
                     )
                 }
 
-                ctx.client.display("Finding ETA for: $voiceText", DisplayOptions())
+                val (routeList, stopList) = etaDb
+                val userPos = LatLng(userLat, userLng)
 
-                // Extract route number via AI
-                val openAI = OpenAI(token = apiKey, host = OpenAIHost(baseUrl))
-                val routeNum = openAI.chatCompletion(
-                    ChatCompletionRequest(
-                        model = ModelId(model),
-                        messages = listOf(
-                            ChatMessage(
-                                role = ChatRole.User,
-                                content = """Extract the KMB bus route number from: "$voiceText"
-User is near $district. Reply with ONLY the route number (e.g. 1, 1A, 234X). Nothing else.""",
-                            )
-                        ),
-                        maxTokens = 10,
-                    )
-                ).choices.firstOrNull()?.message?.content?.trim()?.uppercase() ?: ""
+                // Find stops within 1.5km radius
+                val nearbyStops = stopList.entries
+                    .mapNotNull { (stopId, stopEl) ->
+                        val stopObj = stopEl.jsonObject
+                        val nameObj = stopObj["name"]?.jsonObject ?: return@mapNotNull null
+                        val en = nameObj["en"]?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null
+                        val loc = stopObj["location"]?.jsonObject ?: return@mapNotNull null
+                        val lat = loc["lat"]?.jsonPrimitive?.doubleOrNull ?: return@mapNotNull null
+                        val lng = loc["lng"]?.jsonPrimitive?.doubleOrNull ?: return@mapNotNull null
 
-                if (routeNum.isBlank()) {
+                        val distance = distanceMeters(userPos, LatLng(lat, lng))
+                        if (distance <= NEARBY_STOP_RADIUS_M) {
+                            Triple(stopId, en, distance)
+                        } else null
+                    }
+                    .sortedBy { it.third }
+                    .take(5)
+
+                if (nearbyStops.isEmpty()) {
                     return ctx.client.display(
-                        "Could not identify a route from: $voiceText", DisplayOptions()
+                        "No bus stops within 1.5km of your location.", DisplayOptions()
                     )
                 }
 
-                // First stop of outbound route
-                val stopArr = Json.parseToJsonElement(
-                    client.get(
-                        "$KMB_BASE/route-stop/$routeNum/outbound/1"
-                    ).bodyAsText()
-                ).jsonObject["data"]?.jsonArray ?: JsonArray(emptyList())
+                // Build map of stop ID → set of route IDs
+                val stopRoutes = mutableMapOf<String, MutableSet<String>>()
+                routeList.forEach { (routeId, routeEl) ->
+                    val routeObj = routeEl.jsonObject
+                    val stopsObj = routeObj["stops"]?.jsonObject ?: return@forEach
+                    stopsObj.forEach { (_, stopArrayEl) ->
+                        stopArrayEl.jsonArray.forEach { stopIdEl ->
+                            stopIdEl.jsonPrimitive.contentOrNull?.let { stopId ->
+                                stopRoutes.getOrPut(stopId) { mutableSetOf() }.add(routeId)
+                            }
+                        }
+                    }
+                }
 
-                val stopId = stopArr.firstOrNull()?.jsonObject?.get("stop")?.jsonPrimitive?.content
-                    ?: return ctx.client.display(
-                        "No stops found for bus $routeNum.", DisplayOptions()
-                    )
+                // Stream updates every 5 seconds
+                repeat(12) { iteration ->
+                    val displayText = buildString {
+                        appendLine("=== Live Bus ETA (${(iteration) * 5}s) ===")
+                        appendLine()
 
-                // Stop name
-                val stopName = Json.parseToJsonElement(
-                    client.get("$KMB_BASE/stop/$stopId").bodyAsText()
-                ).jsonObject["data"]?.jsonObject?.get("name_en")?.jsonPrimitive?.contentOrNull
-                    ?: stopId
+                        nearbyStops.forEach { (stopId, stopName, distance) ->
+                            appendLine("📍 $stopName (${distance.toInt()}m)")
+                            val routeIds = stopRoutes[stopId] ?: emptySet()
 
-                val etaBlock =
-                    runCatching { fetchEtaBlock(client, routeNum, "outbound", "1") }.getOrNull()
-                        ?: "No ETA available."
+                            if (routeIds.isEmpty()) {
+                                appendLine("  No routes")
+                            } else {
+                                val etaLines = routeIds.sortedBy { rid ->
+                                    // Sort by route number for readability
+                                    routeList[rid]?.jsonObject?.get("route")?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: 9999
+                                }.mapNotNull { routeId ->
+                                    val routeObj = routeList[routeId]?.jsonObject
+                                        ?: return@mapNotNull null
+                                    val routeNo = routeObj["route"]?.jsonPrimitive?.contentOrNull
+                                        ?: return@mapNotNull null
+                                    val svcType =
+                                        routeObj["serviceType"]?.jsonPrimitive?.contentOrNull
+                                            ?: "1"
+                                    val companies = routeObj["co"]?.jsonArray?.mapNotNull {
+                                        it.jsonPrimitive.contentOrNull
+                                    } ?: emptyList()
+                                    val primaryCo = companies.firstOrNull()
+                                    val routeDest = routeObj["dest"]?.jsonObject?.get("en")
+                                        ?.jsonPrimitive?.contentOrNull ?: ""
 
-                ctx.client.display(buildString {
-                    appendLine("=== Bus ETA ===")
-                    appendLine("KMB Bus: $routeNum")
-                    appendLine("Stop: $stopName")
-                    appendLine()
-                    append(etaBlock)
-                }.trim(), DisplayOptions())
+                                    // Route type icon
+                                    val icon = when (primaryCo) {
+                                        "gmb" -> "🚐"
+                                        "kmb", "ctb", "nlb", "lrtfeeder" -> "🚌"
+                                        "mtr" -> "🚇"
+                                        "lightRail" -> "🚋"
+                                        "fortuneferry", "hkkf", "sunferry" -> "⛴️"
+                                        else -> "🚌"
+                                    }
+                                    val typeLabel = when (primaryCo) {
+                                        "gmb" -> "Minibus"
+                                        else -> "Bus"
+                                    }
+
+                                    val etaInfo = runCatching {
+                                        fetchNearestEta(client, stopId, routeNo, svcType, primaryCo)
+                                    }.getOrNull() ?: "—"
+
+                                    val destStr = if (routeDest.isNotBlank()) " → $routeDest" else ""
+                                    "$icon $typeLabel $routeNo$destStr: $etaInfo"
+                                }
+                                etaLines.forEach { appendLine(it) }
+                            }
+                            appendLine()
+                        }
+
+                        appendLine("(Updates every 5 seconds)")
+                        appendLine("🚌 Bus  🚐 Minibus  🚇 MTR  🚋 Light Rail  ⛴ Ferry")
+                    }
+
+                    ctx.client.display(displayText, DisplayOptions())
+
+                    if (iteration < 11) {
+                        delay(5_000L)
+                    }
+                }
+
+                Result.success(Unit)
             } finally {
                 client.close()
             }
@@ -868,16 +902,21 @@ User is near $district. Reply with ONLY the route number (e.g. 1, 1A, 234X). Not
         routeNum: String,
         bound: String,
         svcType: String,
+        co: String? = null,
     ): String {
+        val baseUrl = when (co) {
+            "gmb" -> GMB_BASE
+            else -> KMB_BASE
+        }
         val stops = Json.parseToJsonElement(
-            client.get("$KMB_BASE/route-stop/$routeNum/$bound/$svcType").bodyAsText()
+            client.get("$baseUrl/route-stop/$routeNum/$bound/$svcType").bodyAsText()
         ).jsonObject["data"]?.jsonArray ?: JsonArray(emptyList())
 
         val stopId = stops.firstOrNull()?.jsonObject?.get("stop")?.jsonPrimitive?.content
             ?: return "No stops found."
 
         val etaArr = Json.parseToJsonElement(
-            client.get("$KMB_BASE/eta/$stopId/$routeNum/$svcType").bodyAsText()
+            client.get("$baseUrl/eta/$stopId/$routeNum/$svcType").bodyAsText()
         ).jsonObject["data"]?.jsonArray ?: JsonArray(emptyList())
 
         val lines = etaArr.take(3).mapNotNull { e ->
@@ -892,6 +931,43 @@ User is near $district. Reply with ONLY the route number (e.g. 1, 1A, 234X). Not
             }.getOrNull()
         }
         return if (lines.isEmpty()) "No upcoming buses." else lines.joinToString("\n")
+    }
+
+    /**
+     * Fetch nearest ETA arrival time for a specific route at a specific stop.
+     * Returns a formatted string like "3 min → Destination" or "—" if no ETA available.
+     * Uses KMB API for KMB buses, GMB API for minibuses, and handles other types gracefully.
+     */
+    private suspend fun fetchNearestEta(
+        client: HttpClient,
+        stopId: String,
+        routeNum: String,
+        svcType: String,
+        co: String?,
+    ): String {
+        val baseUrl = when (co) {
+            "gmb" -> GMB_BASE
+            else -> KMB_BASE  // KMB, CTB, NLB, etc. all use KMB-style API
+        }
+        return try {
+            val etaArr = Json.parseToJsonElement(
+                client.get("$baseUrl/eta/$stopId/$routeNum/$svcType").bodyAsText()
+            ).jsonObject["data"]?.jsonArray ?: JsonArray(emptyList())
+
+            etaArr.firstOrNull()?.jsonObject?.let { eta ->
+                val ts = eta["eta"]?.jsonPrimitive?.contentOrNull ?: return@let null
+                val dest = eta["dest_en"]?.jsonPrimitive?.contentOrNull ?: ""
+                runCatching {
+                    val dt = OffsetDateTime.parse(ts)
+                    val mins = Duration.between(OffsetDateTime.now(dt.offset), dt).toMinutes()
+                    if (mins >= 0) {
+                        if (dest.isNotBlank()) "${mins} min → $dest" else "${mins} min"
+                    } else null
+                }.getOrNull()
+            } ?: "—"
+        } catch (e: Exception) {
+            "—"
+        }
     }
 
     /**
@@ -937,12 +1013,14 @@ User is near $district. Reply with ONLY the route number (e.g. 1, 1A, 234X). Not
             "https://data.weather.gov.hk/weatherAPI/opendata/weather.php?dataType=flw&lang=en"
 
         private const val KMB_BASE = "https://data.etabus.gov.hk/v1/transport/kmb"
+        private const val GMB_BASE = "https://data.etabus.gov.hk/v1/transport/gmb"
         private const val KMB_ROUTES_URL = "$KMB_BASE/route/"
         private const val HK_ETA_DB_URL = "https://data.hkbus.app/routeFareList.min.json"
         private const val HK_ETA_DB_FALLBACK_URL =
             "https://hkbus.github.io/hk-bus-crawling/routeFareList.min.json"
         private const val TAG = "HkRouterPlanner"
         private const val WALKING_RADIUS_M = 500.0
+        private const val NEARBY_STOP_RADIUS_M = 1_500.0
 
         /**
          * Coordinates of HKO automatic weather stations, keyed by the exact place name

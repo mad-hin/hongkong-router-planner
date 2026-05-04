@@ -69,10 +69,92 @@ class HkRouterPlannerEntry : UniversalAppEntrySimple {
     )
 
     override fun commands(): List<UniversalCommand> = listOf(
+        voiceCommand(),
         weatherCommand(),
         planRouteCommand(),
         etaCommand(),
     )
+
+    // ───────────────────────────────────────────────────────────────────────
+    // COMMAND 0 — VOICE CONTROL (listen for keyword → dispatch to mode)
+    // ───────────────────────────────────────────────────────────────────────
+
+    private fun voiceCommand() = object : UniversalCommand {
+        override val id = "voice_control"
+        override val title = "Voice Control"
+
+        override suspend fun run(ctx: UniversalAppContext): Result<Unit> {
+            val apiKey = AIApiSettings.apiKey(ctx.settings)
+            val baseUrl = AIApiSettings.baseUrl(ctx.settings)
+
+            if (apiKey.isBlank()) {
+                return ctx.client.display(
+                    "Please set your AI API key in Settings.", DisplayOptions()
+                )
+            }
+            if (!ctx.client.capabilities.canRecordAudio) {
+                return ctx.client.display(
+                    "Microphone not available on this device.", DisplayOptions()
+                )
+            }
+
+            val client = HttpClient()
+            return try {
+                var running = true
+                while (running) {
+                    ctx.client.display("Listening…\nSay: Weather, ETA, Route, or Stop", DisplayOptions())
+                    val session = ctx.client.startMicrophone().getOrElse { e ->
+                        return ctx.client.display("Mic error: ${e.message}", DisplayOptions())
+                    }
+                    val chunks = withTimeoutOrNull(4_000L) { session.audio.toList() } ?: emptyList()
+                    session.stop()
+
+                    if (chunks.isEmpty()) {
+                        ctx.client.display("No speech detected.\nListening again…", DisplayOptions())
+                        delay(1_000L)
+                        continue
+                    }
+
+                    ctx.client.display("…", DisplayOptions())
+                    val wav = buildWav(chunks.flatMap { it.bytes.toList() }.toByteArray(), session.format)
+                    val spoken = whisperTranscribe(client, wav, apiKey, baseUrl).trim().lowercase()
+                    Log.d(TAG, "Voice control heard: $spoken")
+
+                    when {
+                        spoken.contains("weather") -> {
+                            ctx.client.display("→ Weather mode", DisplayOptions())
+                            weatherCommand().run(ctx)
+                            ctx.client.display("Weather done.\nBack to voice control…", DisplayOptions())
+                            delay(2_000L)
+                        }
+                        spoken.contains("eta") || spoken.contains("bus") || spoken.contains("e t a") -> {
+                            ctx.client.display("→ ETA mode", DisplayOptions())
+                            etaCommand().run(ctx)
+                            ctx.client.display("ETA done.\nBack to voice control…", DisplayOptions())
+                            delay(2_000L)
+                        }
+                        spoken.contains("route") || spoken.contains("plan") || spoken.contains("planning") -> {
+                            ctx.client.display("→ Route planning mode", DisplayOptions())
+                            planRouteCommand().run(ctx)
+                            ctx.client.display("Route done.\nBack to voice control…", DisplayOptions())
+                            delay(2_000L)
+                        }
+                        spoken.contains("stop") || spoken.contains("exit") || spoken.contains("quit") -> {
+                            ctx.client.display("Voice control stopped.", DisplayOptions())
+                            running = false
+                        }
+                        else -> {
+                            ctx.client.display("Didn't catch that.\nSay: Weather, ETA, Route, or Stop", DisplayOptions())
+                            delay(1_500L)
+                        }
+                    }
+                }
+                Result.success(Unit)
+            } finally {
+                client.close()
+            }
+        }
+    }
 
     // ───────────────────────────────────────────────────────────────────────
     // COMMAND 1 — WEATHER REPORT
@@ -472,19 +554,41 @@ class HkRouterPlannerEntry : UniversalAppEntrySimple {
                     runCatching { fetchEtaBlock(client, routeNo, bound, svc) }.getOrNull()
                 }
 
-                ctx.client.display(buildString {
-                    appendLine("=== Route Plan ===")
-                    appendLine("From: $district")
-                    appendLine("To: $destination")
-                    appendLine()
-                    appendLine("Point-to-point results (HKBus DFS method):")
-                    routeSummary.forEach { appendLine(it) }
+                // Build display lines, then paginate to fit glasses display
+                val lines = buildList {
+                    add("=== Route Plan ===")
+                    add("From: $district")
+                    add("To: $destination")
+                    add("")
+                    add("Results (DFS, max 1 transfer):")
+                    routeSummary.forEach { add(it) }
                     etaBlock?.let {
-                        appendLine()
-                        appendLine("Live ETA (first KMB leg):")
-                        append(it)
+                        add("")
+                        add("Live ETA (first leg):")
+                        // Split long ETA block into lines
+                        it.lines().forEach { line -> add(line) }
                     }
-                }.trim(), DisplayOptions())
+                }
+
+                val pageSize = 8
+                val pages = lines.chunked(pageSize)
+                pages.forEachIndexed { idx, pageLines ->
+                    val displayText = buildString {
+                        if (pages.size > 1) {
+                            appendLine("Route (${idx + 1}/${pages.size})")
+                        }
+                        pageLines.forEach { appendLine(it) }
+                        if (idx < pages.lastIndex) {
+                            appendLine()
+                            appendLine("(next in 5s...)")
+                        }
+                    }.trim()
+                    ctx.client.display(displayText, DisplayOptions())
+                    if (idx < pages.lastIndex) {
+                        delay(5_000L)
+                    }
+                }
+                Result.success(Unit)
             } finally {
                 client.close()
             }
